@@ -3,3 +3,4 @@ aiohttp==3.10.5
 aiofiles==24.1.0
 fastapi==0.115.0
 uvicorn==0.30.6
+telethon==1.36.0
