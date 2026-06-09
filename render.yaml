@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: terabot
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: ADMIN_IDS
+        sync: false
+      - key: PRIVATE_CHANNEL_ID
+        sync: false
+      - key: XAPI_KEYS
+        sync: false
+      - key: PORT
+        value: "10000"

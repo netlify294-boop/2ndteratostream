@@ -1,0 +1,7 @@
+.env
+__pycache__/
+*.pyc
+*.pyo
+*.tmp
+terabot_*.mp4
+terabot_*.mkv
