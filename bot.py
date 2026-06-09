@@ -216,23 +216,24 @@ async def resolve_terabox_url(url: str) -> str:
 # ══════════════════ xapiverse Helper ════════════════════
 XAPI_BASE = "https://xapiverse.com/api"
 
-# xapiverse ke possible endpoint formats
+# xapiverse API key HEADER mein jaati hai: "xAPIverse-Key: <key>"
+# Endpoint formats (url param naam alag ho sakta hai)
 XAPI_ENDPOINTS = [
-    # Format 1: GET /api/terabox?url=...&api_key=...
+    # Format 1: GET /api/terabox?url=...   (key header mein)
     lambda base, url, key: (
-        "GET", f"{base}/terabox", {"url": url, "api_key": key}, None
+        "GET", f"{base}/terabox", {"url": url}, None, {"xAPIverse-Key": key}
     ),
-    # Format 2: GET /api/terabox?link=...&api_key=...
+    # Format 2: GET /api/terabox?link=...  (key header mein)
     lambda base, url, key: (
-        "GET", f"{base}/terabox", {"link": url, "api_key": key}, None
+        "GET", f"{base}/terabox", {"link": url}, None, {"xAPIverse-Key": key}
     ),
-    # Format 3: POST /api/terabox with JSON body
+    # Format 3: POST /api/terabox JSON     (key header mein)
     lambda base, url, key: (
-        "POST", f"{base}/terabox", {"api_key": key}, {"url": url}
+        "POST", f"{base}/terabox", {}, {"url": url}, {"xAPIverse-Key": key}
     ),
-    # Format 4: GET /api/download?url=...&api_key=...
+    # Format 4: GET /api/download?url=...  (key header mein)
     lambda base, url, key: (
-        "GET", f"{base}/download", {"url": url, "api_key": key}, None
+        "GET", f"{base}/download", {"url": url}, None, {"xAPIverse-Key": key}
     ),
 ]
 
@@ -285,13 +286,13 @@ async def xapi_get_download_link(terabox_url: str) -> dict | None:
         tried_keys.add(key)
 
         for endpoint_fn in XAPI_ENDPOINTS:
-            method, url, params, json_body = endpoint_fn(XAPI_BASE, terabox_url, key)
+            method, url, params, json_body, req_headers = endpoint_fn(XAPI_BASE, terabox_url, key)
             try:
                 async with aiohttp.ClientSession() as session:
                     if method == "GET":
-                        req = session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=30))
+                        req = session.get(url, params=params, headers=req_headers, timeout=aiohttp.ClientTimeout(total=30))
                     else:
-                        req = session.post(url, params=params, json=json_body, timeout=aiohttp.ClientTimeout(total=30))
+                        req = session.post(url, params=params, json=json_body, headers=req_headers, timeout=aiohttp.ClientTimeout(total=30))
 
                     async with req as resp:
                         raw = await resp.text()
