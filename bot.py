@@ -37,6 +37,9 @@ from telegram.ext import (
 from telegram.constants import ParseMode
 from telegram.error import TelegramError
 
+from telethon import TelegramClient
+from telethon.sessions import StringSession
+
 # ═══════════════════════ Logging ════════════════════════
 logging.basicConfig(
     level=logging.INFO,
@@ -49,6 +52,54 @@ BOT_TOKEN          = os.environ["BOT_TOKEN"]
 ADMIN_IDS_RAW      = os.environ.get("ADMIN_IDS", "")
 ADMIN_IDS          = set(int(x.strip()) for x in ADMIN_IDS_RAW.split(",") if x.strip())
 PRIVATE_CHANNEL_ID = int(os.environ["PRIVATE_CHANNEL_ID"])
+
+# Telethon (MTProto) — needed to stream files > 20MB
+# Get API_ID and API_HASH from https://my.telegram.org
+TELEGRAM_API_ID   = int(os.environ["TELEGRAM_API_ID"])
+TELEGRAM_API_HASH = os.environ["TELEGRAM_API_HASH"]
+TELETHON_SESSION  = os.environ.get("TELETHON_SESSION", "")  # StringSession string
+
+# Telethon connection pool — multiple clients for concurrent streams
+POOL_SIZE = 5
+_telethon_pool: list[TelegramClient] = []
+_pool_lock = asyncio.Lock()
+_pool_index = 0
+
+async def _make_client() -> TelegramClient:
+    client = TelegramClient(
+        StringSession(TELETHON_SESSION),
+        TELEGRAM_API_ID,
+        TELEGRAM_API_HASH,
+        connection_retries=5,
+        retry_delay=2,
+    )
+    await client.connect()
+    if not await client.is_user_authorized():
+        raise RuntimeError("Telethon session is not authorized. Regenerate TELETHON_SESSION.")
+    return client
+
+async def init_telethon_pool():
+    """Call once at startup to pre-create all connections."""
+    global _telethon_pool
+    logger.info("Initializing Telethon pool (size=%d)...", POOL_SIZE)
+    _telethon_pool = []
+    for i in range(POOL_SIZE):
+        client = await _make_client()
+        _telethon_pool.append(client)
+        logger.info("Telethon client %d connected", i + 1)
+    logger.info("Telethon pool ready.")
+
+async def get_telethon_client() -> TelegramClient:
+    """Round-robin pick from pool, reconnect if needed."""
+    global _pool_index
+    async with _pool_lock:
+        client = _telethon_pool[_pool_index % POOL_SIZE]
+        _pool_index += 1
+
+    if not client.is_connected():
+        logger.warning("Telethon client disconnected, reconnecting...")
+        await client.connect()
+    return client
 
 # Public URL of this Render service (e.g. https://terabot.onrender.com)
 # Render sets RENDER_EXTERNAL_URL automatically — fallback to manual setting
@@ -108,67 +159,66 @@ async def health():
     return {"status": "ok"}
 
 
-@web_app.get("/stream/{file_id:path}")
-async def stream_video(file_id: str, request: Request):
+# Semaphore — max concurrent streams (1 per pool client)
+_stream_semaphore = asyncio.Semaphore(POOL_SIZE * 3)
+
+@web_app.get("/stream/{msg_id:int}")
+async def stream_video(msg_id: int, request: Request):
     """
-    Proxy-stream a Telegram file to the browser with Range support.
-    file_id can be the Telegram file_id (unique_id won't work — use file_id).
+    Stream a Telegram channel message's video via Telethon (MTProto).
+    Works for ANY file size — no 20MB Bot API limit.
+    URL format: /stream/<message_id>
     """
-    # Step 1: resolve file path via getFile
-    get_file_url = f"https://api.telegram.org/bot{BOT_TOKEN}/getFile?file_id={file_id}"
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(get_file_url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-                data = await resp.json()
-    except Exception as e:
-        logger.error("getFile error: %s", e)
-        raise HTTPException(502, "Could not contact Telegram API")
+    async with _stream_semaphore:
+        try:
+            client = await get_telethon_client()
+            messages = await client.get_messages(PRIVATE_CHANNEL_ID, ids=msg_id)
+            if not messages or not messages.media:
+                raise HTTPException(404, "Message not found or has no media")
 
-    if not data.get("ok"):
-        logger.warning("getFile not ok: %s", data)
-        raise HTTPException(404, "File not found on Telegram")
+            media = messages.media
+            doc   = getattr(media, "document", None) or getattr(media, "video", None)
+            if not doc:
+                raise HTTPException(404, "No video in this message")
 
-    file_path = data["result"]["file_path"]
-    tg_url    = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}"
-    file_size = data["result"].get("file_size", 0)
+            file_size = doc.size
 
-    # Step 2: forward Range header (enables seeking in Chrome)
-    range_header = request.headers.get("range")
-    req_headers  = {"User-Agent": "TeraBot/1.0"}
-    if range_header:
-        req_headers["Range"] = range_header
+            range_header   = request.headers.get("range", "")
+            start = 0
+            end   = file_size - 1
 
-    # Step 3: stream from Telegram → browser
-    async def generator():
-        async with aiohttp.ClientSession() as session:
-            async with session.get(
-                tg_url,
-                headers=req_headers,
-                timeout=aiohttp.ClientTimeout(total=0),   # unlimited
-            ) as tg_resp:
-                async for chunk in tg_resp.content.iter_chunked(256 * 1024):
-                    yield chunk
+            if range_header.startswith("bytes="):
+                parts = range_header[6:].split("-")
+                start = int(parts[0]) if parts[0] else 0
+                end   = int(parts[1]) if len(parts) > 1 and parts[1] else file_size - 1
 
-    # Detect content type
-    ext = file_path.rsplit(".", 1)[-1].lower() if "." in file_path else "mp4"
-    mime_map = {
-        "mp4": "video/mp4", "mkv": "video/x-matroska",
-        "avi": "video/x-msvideo", "mov": "video/quicktime",
-        "webm": "video/webm", "ts": "video/mp2t",
-    }
-    content_type = mime_map.get(ext, "video/mp4")
+            content_length = end - start + 1
 
-    # Build response headers
-    resp_headers = {
-        "Accept-Ranges": "bytes",
-        "Content-Type": content_type,
-        "Cache-Control": "no-cache",
-    }
-    if file_size:
-        resp_headers["Content-Length"] = str(file_size)
+            async def generator():
+                offset    = start
+                remaining = content_length
+                async for chunk in client.iter_download(doc, offset=offset, request_size=1024*1024):
+                    if remaining <= 0:
+                        break
+                    data = chunk[:remaining]
+                    remaining -= len(data)
+                    yield data
 
-    status_code = 206 if range_header else 200
-    return StreamingResponse(generator(), status_code=status_code, headers=resp_headers)
+            status_code = 206 if range_header else 200
+            resp_headers = {
+                "Content-Type":   "video/mp4",
+                "Accept-Ranges":  "bytes",
+                "Content-Length": str(content_length),
+                "Content-Range":  f"bytes {start}-{end}/{file_size}",
+                "Cache-Control":  "no-cache",
+            }
+            return StreamingResponse(generator(), status_code=status_code, headers=resp_headers)
+
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error("Stream error for msg_id=%s: %s", msg_id, e)
+            raise HTTPException(500, f"Stream error: {e}")
 
 
 # ═══════════════════ Catbox Upload ══════════════════════
@@ -328,8 +378,8 @@ async def safe_edit(msg: Message, text: str) -> None:
     except TelegramError:
         pass
 
-def build_stream_url(file_id: str) -> str:
-    return f"{PUBLIC_URL}/stream/{file_id}"
+def build_stream_url(message_id: int) -> str:
+    return f"{PUBLIC_URL}/stream/{message_id}"
 
 
 # ═══════════════════ Bot Handlers ═══════════════════════
@@ -421,9 +471,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                             connect_timeout=30,
                         )
 
-                    # Use file_id for streaming (works for any size)
-                    vid_file_id  = sent.video.file_id
-                    stream_url   = build_stream_url(vid_file_id)
+                    # Use message_id for Telethon streaming (no size limit)
+                    stream_url = build_stream_url(sent.message_id)
 
                     results.append(
                         f"🎬 <b>{safe_title}</b>\n\n"
@@ -512,6 +561,9 @@ def run_bot():
 
 
 if __name__ == "__main__":
+    # Initialize Telethon connection pool at startup
+    asyncio.run(init_telethon_pool())
+
     # Start bot in a background daemon thread
     bot_thread = threading.Thread(target=run_bot, daemon=True)
     bot_thread.start()
