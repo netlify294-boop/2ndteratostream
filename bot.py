@@ -75,10 +75,23 @@ async def next_api_key() -> str:
 # ═══════════════════ Regex Patterns ═════════════════════
 TERABOX_PATTERN = re.compile(
     r"https?://(?:www\.)?"
-    r"(?:terabox\.com|teraboxapp\.com|1024tera\.com|terabox\.fun|"
-    r"terafileshare\.com|terasharelink\.com|teraboxlink\.com|"
-    r"nephobox\.com|4funbox\.com|mirrobox\.com|momerybox\.com|"
-    r"tibibox\.com|freeterabox\.com|terabox\.app)"
+    r"(?:"
+    r"terabox\.com|"
+    r"1024terabox\.com|1024tera\.com|"
+    r"teraboxapp\.com|"
+    r"terabox\.app|"
+    r"nephobox\.com|"
+    r"mirrorbox\.com|mirrobox\.com|"
+    r"momerybox\.com|"
+    r"freeterabox\.com|"
+    r"teraboxlink\.com|"
+    r"4funbox\.com|"
+    r"terafileshare\.com|"
+    r"teraboxshare\.com|"
+    r"terasharelink\.com|"
+    r"tibibox\.com|"
+    r"terabox\.fun"
+    r")"
     r"/[^\s\"\'><]+",
     re.IGNORECASE,
 )
@@ -177,50 +190,133 @@ async def upload_to_catbox(image_bytes: bytes, filename: str = "image.jpg") -> s
     return None
 
 
+# ══════════════════ URL Resolver ════════════════════════
+async def resolve_terabox_url(url: str) -> str:
+    """
+    Follow redirects to get the final URL.
+    Many short/mirror domains (terasharelink, nephobox, etc.)
+    redirect to the real terabox.com URL — xapiverse needs that.
+    """
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                url,
+                allow_redirects=True,
+                timeout=aiohttp.ClientTimeout(total=15),
+                headers={"User-Agent": "Mozilla/5.0"},
+            ) as resp:
+                final = str(resp.url)
+                if final != url:
+                    logger.info("Resolved %s → %s", url, final)
+                return final
+    except Exception as e:
+        logger.warning("URL resolve failed for %s: %s — using original", url, e)
+        return url
+
 # ══════════════════ xapiverse Helper ════════════════════
 XAPI_BASE = "https://xapiverse.com/api"
 
+# xapiverse ke possible endpoint formats
+XAPI_ENDPOINTS = [
+    # Format 1: GET /api/terabox?url=...&api_key=...
+    lambda base, url, key: (
+        "GET", f"{base}/terabox", {"url": url, "api_key": key}, None
+    ),
+    # Format 2: GET /api/terabox?link=...&api_key=...
+    lambda base, url, key: (
+        "GET", f"{base}/terabox", {"link": url, "api_key": key}, None
+    ),
+    # Format 3: POST /api/terabox with JSON body
+    lambda base, url, key: (
+        "POST", f"{base}/terabox", {"api_key": key}, {"url": url}
+    ),
+    # Format 4: GET /api/download?url=...&api_key=...
+    lambda base, url, key: (
+        "GET", f"{base}/download", {"url": url, "api_key": key}, None
+    ),
+]
+
+def _extract_dl(data: dict) -> str | None:
+    """Extract download URL from any known xapiverse response shape."""
+    # Direct fields
+    for field in ("download_url", "url", "link", "direct_link", "dlink", "download"):
+        val = data.get(field)
+        if val and val.startswith("http"):
+            return val
+    # Nested under "data"
+    nested = data.get("data") or data.get("result") or {}
+    if isinstance(nested, dict):
+        for field in ("download_url", "url", "link", "direct_link", "dlink"):
+            val = nested.get(field)
+            if val and val.startswith("http"):
+                return val
+    # List of results → take first
+    if isinstance(nested, list) and nested:
+        item = nested[0]
+        for field in ("download_url", "url", "link", "dlink"):
+            val = item.get(field, "") if isinstance(item, dict) else ""
+            if val and val.startswith("http"):
+                return val
+    return None
+
+def _extract_title(data: dict) -> str:
+    for field in ("title", "name", "filename", "file_name"):
+        v = data.get(field)
+        if v:
+            return v
+    nested = data.get("data") or data.get("result") or {}
+    if isinstance(nested, dict):
+        for field in ("title", "name", "filename"):
+            v = nested.get(field)
+            if v:
+                return v
+    return "video"
+
 async def xapi_get_download_link(terabox_url: str) -> dict | None:
-    tried = set()
+    """
+    Try all 8 API keys × all endpoint formats until one succeeds.
+    Logs full response so we can debug new API shapes easily.
+    """
+    tried_keys = set()
     for _ in range(len(XAPI_KEYS)):
         key = await next_api_key()
-        if key in tried:
+        if key in tried_keys:
             continue
-        tried.add(key)
-        params = {"url": terabox_url, "api_key": key}
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(
-                    f"{XAPI_BASE}/terabox",
-                    params=params,
-                    timeout=aiohttp.ClientTimeout(total=30),
-                ) as resp:
-                    data = await resp.json(content_type=None)
-                    logger.info("xapi (key …%s): %s", key[-6:], data)
-                    if resp.status == 200:
-                        dl = (
-                            data.get("download_url")
-                            or data.get("url")
-                            or data.get("link")
-                            or (data.get("data") or {}).get("download_url")
-                            or (data.get("data") or {}).get("url")
-                        )
-                        if dl:
-                            return {
-                                "download_url": dl,
-                                "title": (
-                                    data.get("title")
-                                    or (data.get("data") or {}).get("title")
-                                    or "video"
-                                ),
-                                "size": (
-                                    data.get("size")
-                                    or (data.get("data") or {}).get("size")
-                                    or 0
-                                ),
-                            }
-        except Exception as e:
-            logger.warning("xapi key %s error: %s", key[-6:], e)
+        tried_keys.add(key)
+
+        for endpoint_fn in XAPI_ENDPOINTS:
+            method, url, params, json_body = endpoint_fn(XAPI_BASE, terabox_url, key)
+            try:
+                async with aiohttp.ClientSession() as session:
+                    if method == "GET":
+                        req = session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=30))
+                    else:
+                        req = session.post(url, params=params, json=json_body, timeout=aiohttp.ClientTimeout(total=30))
+
+                    async with req as resp:
+                        raw = await resp.text()
+                        logger.info("xapi [%s %s key=…%s] status=%s body=%s",
+                                    method, url, key[-6:], resp.status, raw[:300])
+                        try:
+                            data = await resp.json(content_type=None)
+                        except Exception:
+                            continue
+
+                        if resp.status == 200:
+                            dl = _extract_dl(data)
+                            if dl:
+                                return {
+                                    "download_url": dl,
+                                    "title": _extract_title(data),
+                                    "size": (
+                                        data.get("size")
+                                        or (data.get("data") or {}).get("size")
+                                        or 0
+                                    ),
+                                }
+            except Exception as e:
+                logger.warning("xapi [%s key=…%s] exception: %s", url, key[-6:], e)
+
     return None
 
 
@@ -323,7 +419,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
         await safe_edit(status_msg, f"🔗 <b>Resolving Terabox link…</b>\n<code>{first_url}</code>")
 
-        xapi_data = await xapi_get_download_link(first_url)
+        # Follow redirects — mirror domains redirect to actual terabox.com URL
+        resolved_url = await resolve_terabox_url(first_url)
+        xapi_data = await xapi_get_download_link(resolved_url)
         if not xapi_data:
             results.append(
                 f"❌ <b>xapiverse could not resolve this link.</b>\n"
