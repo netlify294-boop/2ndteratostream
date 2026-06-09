@@ -408,16 +408,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             else:
                 await safe_edit(status_msg, f"📤 <b>Uploading to private channel…</b>")
                 try:
-                    async with aiofiles.open(video_path, "rb") as vf:
-                        video_bytes = await vf.read()
-
-                    sent = await context.bot.send_video(
-                        chat_id=PRIVATE_CHANNEL_ID,
-                        video=video_bytes,
-                        caption=f"🎬 {safe_title}\n\nSource: {first_url}",
-                        supports_streaming=True,
-                        filename=f"{safe_title}.mp4",
-                    )
+                    # Open as file object — no RAM spike, 10min timeout for large files
+                    with open(video_path, "rb") as vf:
+                        sent = await context.bot.send_video(
+                            chat_id=PRIVATE_CHANNEL_ID,
+                            video=vf,
+                            caption=f"🎬 {safe_title}\n\nSource: {first_url}",
+                            supports_streaming=True,
+                            filename=f"{safe_title}.mp4",
+                            write_timeout=600,
+                            read_timeout=600,
+                            connect_timeout=30,
+                        )
 
                     # Use file_id for streaming (works for any size)
                     vid_file_id  = sent.video.file_id
@@ -483,6 +485,9 @@ def run_bot():
         app = (
             ApplicationBuilder()
             .token(BOT_TOKEN)
+            .write_timeout(600)
+            .read_timeout(600)
+            .connect_timeout(30)
             .build()
         )
         app.add_handler(CommandHandler("start", cmd_start))
