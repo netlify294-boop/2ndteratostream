@@ -214,44 +214,14 @@ async def resolve_terabox_url(url: str) -> str:
         return url
 
 # ══════════════════ xapiverse Helper ════════════════════
-# xapiverse 2-step flow:
-#   Step 1: GET /api/terabox?url=...  -> returns list[] with fs_id, name, size
-#   Step 2: GET /api/terabox?fs_id=... -> returns actual download_url
-# API key goes in header: "xAPIverse-Key: <key>"
+# API: POST https://xapiverse.com/api/terabox
+# Headers: Content-Type: application/json, xAPIverse-Key: <key>
+# Body:    {"url": "<terabox_url>"}
+# Response: {"status":"success","list":[{"normal_dlink":..,"name":..,"size":..}]}
 
-XAPI_BASE = "https://xapiverse.com/api"
+XAPI_BASE = "https://xapiverse.com/api/terabox"
 
-async def _xapi_call(session, method, endpoint, params, json_body, key):
-    """Single xapiverse API call. Returns parsed JSON or None."""
-    headers = {"xAPIverse-Key": key}
-    try:
-        if method == "GET":
-            req = session.get(endpoint, params=params, headers=headers,
-                              timeout=aiohttp.ClientTimeout(total=30))
-        else:
-            req = session.post(endpoint, params=params, json=json_body, headers=headers,
-                               timeout=aiohttp.ClientTimeout(total=30))
-        async with req as resp:
-            raw = await resp.text()
-            logger.info("xapi [%s %s key=...%s] status=%s body=%s",
-                        method, endpoint, key[-6:], resp.status, raw[:400])
-            if resp.status == 200:
-                try:
-                    return await resp.json(content_type=None)
-                except Exception:
-                    pass
-    except Exception as e:
-        logger.warning("xapi exception [%s]: %s", endpoint, e)
-    return None
-
-
-async def xapi_get_download_link(terabox_url):
-    """
-    2-step xapiverse flow:
-      1. Resolve terabox URL -> get fs_id + title from list[]
-      2. Use fs_id to get actual download_url
-    Tries all 8 API keys, rotating on failure.
-    """
+async def xapi_get_download_link(terabox_url: str) -> dict | None:
     tried_keys = set()
 
     for _ in range(len(XAPI_KEYS)):
@@ -260,87 +230,58 @@ async def xapi_get_download_link(terabox_url):
             continue
         tried_keys.add(key)
 
-        async with aiohttp.ClientSession() as session:
+        headers = {
+            "Content-Type": "application/json",
+            "xAPIverse-Key": key,
+        }
+        payload = {"url": terabox_url}
 
-            # Step 1: Get file list
-            list_data = None
-            for method, params, body in [
-                ("GET",  {"url": terabox_url}, None),
-                ("GET",  {"link": terabox_url}, None),
-                ("POST", {}, {"url": terabox_url}),
-            ]:
-                list_data = await _xapi_call(
-                    session, method, f"{XAPI_BASE}/terabox", params, body, key
-                )
-                if list_data and list_data.get("status") == "success":
-                    break
-                list_data = None
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    XAPI_BASE,
+                    json=payload,
+                    headers=headers,
+                    timeout=aiohttp.ClientTimeout(total=30),
+                ) as resp:
+                    raw = await resp.text()
+                    logger.info("xapi [key=...%s] status=%s body=%s",
+                                key[-6:], resp.status, raw[:500])
 
-            if not list_data:
-                continue
+                    if resp.status != 200:
+                        continue
 
-            file_list = list_data.get("list") or []
-            if not file_list:
-                logger.warning("xapi: empty list in response")
-                continue
+                    data = await resp.json(content_type=None)
 
-            first_file = file_list[0]
-            fs_id = str(first_file.get("fs_id", ""))
-            title = first_file.get("name") or first_file.get("title") or "video"
-            size  = first_file.get("size") or 0
+                    if data.get("status") != "success":
+                        continue
 
-            # Check if download_url already in list item
-            for field in ("download_url", "url", "link", "dlink", "direct_link"):
-                val = first_file.get(field, "")
-                if val and str(val).startswith("http"):
-                    logger.info("xapi: got direct URL from list item")
-                    return {"download_url": val, "title": title, "size": size}
+                    file_list = data.get("list") or []
+                    if not file_list:
+                        continue
 
-            if not fs_id:
-                logger.warning("xapi: no fs_id in list item: %s", first_file)
-                continue
+                    item  = file_list[0]
+                    title = item.get("name") or "video"
+                    size  = item.get("size") or 0
 
-            # Step 2: Get download URL using fs_id
-            dl_data = None
-            for method, params, body in [
-                ("GET",  {"fs_id": fs_id}, None),
-                ("GET",  {"fs_id": fs_id, "url": terabox_url}, None),
-                ("POST", {}, {"fs_id": fs_id}),
-                ("POST", {}, {"fs_id": fs_id, "url": terabox_url}),
-            ]:
-                dl_data = await _xapi_call(
-                    session, method, f"{XAPI_BASE}/terabox", params, body, key
-                )
-                if dl_data and dl_data.get("status") == "success":
-                    break
-                dl_data = None
+                    # normal_dlink = permanent download link, use this for downloading
+                    dl_url = (
+                        item.get("normal_dlink")
+                        or item.get("download_url")
+                        or item.get("url")
+                    )
 
-            if not dl_data:
-                logger.warning("xapi: step2 failed for fs_id=%s", fs_id)
-                continue
+                    if dl_url:
+                        return {
+                            "download_url": dl_url,
+                            "title":        title,
+                            "size":         size,
+                        }
 
-            # Extract download URL from step-2 response
-            for field in ("download_url", "url", "link", "dlink", "direct_link"):
-                val = dl_data.get(field, "")
-                if val and str(val).startswith("http"):
-                    return {"download_url": val, "title": title, "size": size}
-
-            nested = dl_data.get("data") or dl_data.get("result") or {}
-            if isinstance(nested, dict):
-                for field in ("download_url", "url", "link", "dlink"):
-                    val = nested.get(field, "")
-                    if val and str(val).startswith("http"):
-                        return {"download_url": val, "title": title, "size": size}
-            if isinstance(nested, list) and nested:
-                for field in ("download_url", "url", "link", "dlink"):
-                    val = nested[0].get(field, "") if isinstance(nested[0], dict) else ""
-                    if val and str(val).startswith("http"):
-                        return {"download_url": val, "title": title, "size": size}
-
-            logger.warning("xapi: step2 response had no download URL: %s", str(dl_data)[:300])
+        except Exception as e:
+            logger.warning("xapi key=...%s exception: %s", key[-6:], e)
 
     return None
-
 
 
 # ═══════════════════ Video Download ═════════════════════
