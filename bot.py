@@ -158,6 +158,11 @@ async def index():
 async def health():
     return {"status": "ok"}
 
+@web_app.on_event("startup")
+async def startup_event():
+    """Init Telethon pool in FastAPI's event loop — must be done here."""
+    await init_telethon_pool()
+
 
 # Semaphore — max concurrent streams (1 per pool client)
 _stream_semaphore = asyncio.Semaphore(POOL_SIZE * 3)
@@ -561,9 +566,6 @@ def run_bot():
 
 
 if __name__ == "__main__":
-    # Initialize Telethon connection pool at startup
-    asyncio.run(init_telethon_pool())
-
     # Start bot in a background daemon thread
     bot_thread = threading.Thread(target=run_bot, daemon=True)
     bot_thread.start()
